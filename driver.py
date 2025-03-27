@@ -195,7 +195,7 @@ class Driver(object):
     def get_track_driver_car(self):
         try:
             base_dir = os.path.join(
-                "C:/Users/ayaan/Documents/University/Semester 6/Aritificial Intelligence/Project/torcs"
+                "C:\\Program Files (x86)\\torcs"
             )
             quickrace_xml = os.path.join(base_dir, "config/raceman/quickrace.xml")
             tree = ET.parse(quickrace_xml)
