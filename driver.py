@@ -11,17 +11,16 @@ class Driver(object):
         self.state = carState.CarState()
         self.control = carControl.CarControl()
 
+        # Start in forward gear (1)
         self.gear = 1
-        self.prev_rpm = None
         self.accel = 0.0
         self.brake = 0.0
         self.steer = 0.0
 
-        # Removed manual gear override; using automatic gear shifting.
-        self.last_gear_up = False
-        self.last_gear_down = False
-
         self.was_reversing = False
+
+        # Add a steering sensitivity scale. Adjust this value (0.0 to 1.0) to change how sensitive the steering is.
+        self.steering_scale = 1.0
 
         # Updated CSV header to include all telemetry fields and arrow key states.
         self.logfile = open("driving_data.csv", "w", newline="")
@@ -47,56 +46,66 @@ class Driver(object):
     def drive(self, msg):
         self.state.setFromMsg(msg)
 
-        rpm = self.state.getRpm()
         speedX = self.state.getSpeedX()
+        rpm = self.state.getRpm()
 
+        # Reset control values
         self.steer = 0.0
         self.accel = 0.0
         self.brake = 0.0
 
-        # Determine arrow key states as boolean values (1 for pressed, 0 for not pressed)
+        # Determine arrow key states (1 if pressed, else 0)
         left_key = 1 if keyboard.is_pressed('left') else 0
         right_key = 1 if keyboard.is_pressed('right') else 0
         up_key = 1 if keyboard.is_pressed('up') else 0
         down_key = 1 if keyboard.is_pressed('down') else 0
 
-        # --- Steering ---
+        # --- Steering with Smoothing ---
+        # Compute target steering value based on key input.
+        target_steer = 0.0
         if left_key:
-            self.steer = 1.0
+            target_steer = self.steering_scale
         elif right_key:
-            self.steer = -1.0
+            target_steer = -self.steering_scale
+        else:
+            target_steer = 0.0
+
+        # Apply smoothing: move 20% of the way toward target each cycle.
+        smoothing_factor = 0.2
+        self.steer = (1 - smoothing_factor) * self.steer + smoothing_factor * target_steer
 
         # --- Reverse / Forward Management ---
-        reversing = False
         if down_key and speedX < 1:
             self.accel = 0.5
             self.gear = -1
-            reversing = True
         elif up_key:
             self.accel = 1.0
             if self.gear < 1:
-                self.gear = 1  # switch to forward gear after reversing
-            reversing = False
+                self.gear = 1
         elif down_key:
             self.brake = 1.0
 
-        # --- Automatic Gear Logic ---
-        # Use current RPM and previous RPM to decide whether to upshift or downshift.
-        if rpm is not None:
-            # Set up flag based on RPM increase compared to previous cycle.
-            if self.prev_rpm is None:
-                up = True
-            else:
-                up = (rpm - self.prev_rpm) > 0
+        # --- Automatic Gear Logic Based on Speed ---
+        if self.gear != -1:
+            threshold = 50  # Adjust threshold step as needed
+            new_gear = int(speedX // threshold) + 1
+            if new_gear < 1:
+                new_gear = 1
+            elif new_gear > 6:
+                new_gear = 6
+            self.gear = new_gear
 
-            # Automatically shift gear based on RPM thresholds.
-            # (You can adjust the thresholds and gear limits as needed.)
-            if up and rpm > 7000 and self.gear < 6:
-                self.gear += 1
-            elif not up and rpm < 3000 and self.gear > 1:
-                self.gear -= 1
-
-            self.prev_rpm = rpm
+        # --- Steering Damping Based on Track Position ---
+        # Get the current lateral position of the car.
+        track_pos = self.state.getTrackPos()
+        if track_pos is not None:
+            # If the car is off-track (|trackPos| > 1), then reduce steering to help straighten out.
+            if abs(track_pos) > 1.0:
+                # Dampen steering command (you can adjust the damping factor).
+                damping_factor = 0.5
+                self.steer *= damping_factor
+                # Optionally, reduce acceleration to avoid excessive turning at high speeds.
+                self.accel = min(self.accel, 0.5)
 
         # --- Apply Control ---
         self.control.setGear(self.gear)
@@ -121,7 +130,7 @@ class Driver(object):
                 self.state.getLastLapTime(),
                 str(self.state.getOpponents()),
                 self.state.getRacePos(),
-                self.state.getRpm(),
+                rpm,
                 str(self.state.getTrack()),
                 self.state.getTrackPos(),
                 str(self.state.getWheelSpinVel()),
