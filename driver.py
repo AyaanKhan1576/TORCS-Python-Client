@@ -3,6 +3,7 @@ import carState
 import carControl
 import keyboard
 import csv
+import os
 
 class Driver(object):
     def __init__(self, stage):
@@ -23,15 +24,18 @@ class Driver(object):
         self.steering_scale = 1.0
 
         # Updated CSV header to include all telemetry fields and arrow key states.
-        self.logfile = open("driving_data.csv", "w", newline="")
+        file_exists = os.path.isfile("driving_data.csv")
+        self.logfile = open("driving_data.csv", "a", newline="")  
         self.logger = csv.writer(self.logfile)
-        self.logger.writerow([
-            "speedX", "speedY", "speedZ", "angle", "curLapTime", "damage",
-            "distFromStart", "distRaced", "focus", "fuel", "gear", "lastLapTime",
-            "opponents", "racePos", "rpm", "track", "trackPos", "wheelSpinVel", "z",
-            "steer_input", "accel_input", "brake_input",
-            "left_key", "right_key", "up_key", "down_key"
-        ])
+
+        if not file_exists:
+            self.logger.writerow([
+                "speedX", "speedY", "speedZ", "angle", "curLapTime", "damage",
+                "distFromStart", "distRaced", "focus", "fuel", "gear", "lastLapTime",
+                "opponents", "racePos", "rpm", "track", "trackPos", "wheelSpinVel", "z",
+                "steer_input", "accel_input", "brake_input",
+                "left_key", "right_key", "up_key", "down_key"
+            ])
 
     def init(self):
         angles = [0 for x in range(19)]
