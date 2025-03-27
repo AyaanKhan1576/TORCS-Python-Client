@@ -3,7 +3,6 @@ import socket
 import driver
 
 def main():
-    # Default parameters
     host_ip = "localhost"
     host_port = 3001
     bot_id = "SCR"
