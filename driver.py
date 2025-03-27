@@ -44,26 +44,34 @@ class Driver(object):
                 r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs"
             )
             quickrace_xml = os.path.join(base_dir, "config/raceman/quickrace.xml")
+            # Parse quickrace.xml to get track name and focused driver info.
             tree = ET.parse(quickrace_xml)
             root = tree.getroot()
 
-            # === Get Track Name ===
             track_section = root.find(".//section[@name='Tracks']/section")
-            track_name = track_section.find("attstr[@name='name']").attrib['val'] if track_section is not None else "unknown_track"
+            track_name = (track_section.find("attstr[@name='name']").attrib['val']
+                          if track_section is not None else "unknown_track")
 
-            # === Get Driver Info ===
             drivers_section = root.find(".//section[@name='Drivers']")
-            focused_idx = drivers_section.find("attnum[@name='focused idx']").attrib['val']
-            focused_module = drivers_section.find("attstr[@name='focused module']").attrib['val']
+            focused_idx = drivers_section.find("attnum[@name='focused idx']").attrib['val'] if drivers_section.find("attnum[@name='focused idx']") is not None else "0"
+            focused_module = drivers_section.find("attstr[@name='focused module']").attrib['val'] if drivers_section.find("attstr[@name='focused module']") is not None else "unknown_driver"
 
-            # === Get Car Name from .rgb file in driver's folder ===
-            driver_dir = os.path.join(base_dir, f"drivers/{focused_module}/{focused_idx}")
-            car_name = "unknown_car"
-            if os.path.exists(driver_dir):
-                for f in os.listdir(driver_dir):
-                    if f.endswith(".rgb"):
-                        car_name = os.path.splitext(f)[0]
-                        break
+            # === Now parse scr_server.xml to fetch the car name ===
+            # Assuming scr_server.xml is located at: C:\Program Files (x86)\torcs\drivers\scr_server\scr_server.xml
+            scr_server_xml = os.path.join(base_dir, "drivers", focused_module, "scr_server.xml")
+            tree2 = ET.parse(scr_server_xml)
+            root2 = tree2.getroot()
+
+            # In scr_server.xml, find the focused driver's robot definition using the focused index.
+            # The structure is: <params name="scr_server" ...>\n  <section name="Robots">\n    <section name="index">\n      <section name="0"> ... </section>\n      ...\n    </section>\n  </section>\n</params>
+            driver_section = root2.find(f".//section[@name='Robots']/section[@name='index']/section[@name='{focused_idx}']")
+            if driver_section is None:
+                # If not found by focused index, fall back to the first section.
+                driver_section = root2.find(".//section[@name='Robots']/section[@name='index']/section")
+            if driver_section is not None:
+                car_name = driver_section.find("attstr[@name='car name']").attrib['val']
+            else:
+                car_name = "unknown_car"
 
             return track_name, focused_module, car_name
         except Exception as e:
