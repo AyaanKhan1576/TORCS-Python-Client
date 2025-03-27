@@ -165,6 +165,9 @@ class CarState(object):
     def setFocusD(self):
         self.focus = self.getFloatListD('focus')
     
+    def getFocus(self):
+        return self.focus
+
     def setFuel(self, fuel):
         self.fuel = fuel
     
@@ -188,6 +191,9 @@ class CarState(object):
     
     def setLastLapTimeD(self):
         self.lastLapTime = self.getFloatD('lastLapTime')
+    
+    def getLastLapTime(self):
+        return self.lastLapTime
     
     def setOpponents(self, opponents):
         self.opponents = opponents
