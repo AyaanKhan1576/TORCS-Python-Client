@@ -2,3 +2,4 @@ __pycache__
 .venv
 *.pyc
 driving_data.csv
+driving_data_test.csv

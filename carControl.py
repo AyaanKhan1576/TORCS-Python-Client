@@ -68,5 +68,11 @@ class CarControl(object):
     
     def getMeta(self):
         return self.meta
+    
+    def setFocus(self, f):
+        self.focus = f
+        
+    def getFocus(self):
+        return self.focus
         
         
