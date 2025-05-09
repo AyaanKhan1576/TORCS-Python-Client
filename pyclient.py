@@ -4,26 +4,26 @@ import driver
 import xml.etree.ElementTree as ET
 import os
 
-#SCR_SERVER_PATH = r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs\drivers\scr_server\scr_server.xml"
-NEW_CAR_NAME = "acura-nsx-sz"  # Change this to the desired car model
+SCR_SERVER_PATH = r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs\drivers\scr_server\scr_server.xml"
+NEW_CAR_NAME = "Peugeot 406"  # Change this to the desired car model
 
-# def update_car_model():
-#     try:
-#         tree = ET.parse(SCR_SERVER_PATH)
-#         root = tree.getroot()
+def update_car_model():
+    try:
+        tree = ET.parse(SCR_SERVER_PATH)
+        root = tree.getroot()
         
-#         for section in root.findall(".//section[@name='index']/section"):
-#             car = section.find("attstr[@name='car name']")
-#             if car is not None:
-#                 car.set("val", NEW_CAR_NAME)
+        for section in root.findall(".//section[@name='index']/section"):
+            car = section.find("attstr[@name='car name']")
+            if car is not None:
+                car.set("val", NEW_CAR_NAME)
         
-#         tree.write(SCR_SERVER_PATH)
-#         print(f"Updated all car models to {NEW_CAR_NAME} in scr_server.xml")
-#     except Exception as e:
-#         print(f"Error updating car model: {e}")
+        tree.write(SCR_SERVER_PATH)
+        print(f"Updated all car models to {NEW_CAR_NAME} in scr_server.xml")
+    except Exception as e:
+        print(f"Error updating car model: {e}")
 
 def main():
-    # update_car_model()  # Update the car before starting the client
+    #update_car_model()  # Update the car before starting the client
 
     host_ip = "localhost"
     host_port = 3001
