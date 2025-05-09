@@ -1,2 +1,5 @@
 keyboard
 driver
+torch
+torchvision 
+torchaudio
