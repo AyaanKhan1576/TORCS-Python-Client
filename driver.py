@@ -1,153 +1,195 @@
-# import msgParser, carState, carControl, keyboard
-# import csv, os, time, xml.etree.ElementTree as ET
-# import numpy as np, joblib
 
-# MODEL_PATH = "torcs_model.pkl"   # ← must match train_model.py
 
-# class Driver(object):
-#     # ──────────────────────────────────────────────────────────
-#     def __init__(self, stage):
-#         self.stage  = stage
-#         self.parser = msgParser.MsgParser()
-#         self.state  = carState.CarState()
+# # driver.py  — hybrid TORCS client (ML + keyboard)  ⚙️
+# # ───────────────────────────────────────────────────────────────────────
+# # * Fixes *
+# #   • Logs *simulator-reported* gear & RPM without accidental overrides.
+# #   • Adds commandedGear to CSV for debugging but keeps real gear untouched.
+# #   • Flushes log every tick so values are written immediately.
+# #   • Minor clean-ups / clearer comments; driving logic unchanged.
+# # ───────────────────────────────────────────────────────────────────────
+
+# # ───────── configuration ─────────
+# USE_ML            = False      # False → keyboard / heuristic only
+# FOCUS_ACTIVE      = False
+# ENABLE_AUTO_RESET = True
+# STUCK_SECONDS     = 15.0
+# TARGET_SPEED_LOW  = 5.0        # m/s – below this we suppress ML brake
+
+# MODEL_FILE   = "torcs_model.pt"
+# PREPROC_FILE = "preproc.pkl"
+
+# # ───────── imports ───────────────
+# import os, csv, glob, re, math, xml.etree.ElementTree as ET
+# import numpy as np, torch, keyboard, msgParser, carState, carControl
+# from utils  import load_preproc, scale_row, ALL_NUM
+# from models import build_mlp
+
+
+# # ───────── TORCS driver ──────────
+# class Driver:
+#     def __init__(self, stage: int):
+#         # objects
+#         self.stage   = stage
+#         self.parser  = msgParser.MsgParser()
+#         self.state   = carState.CarState()
 #         self.control = carControl.CarControl()
 
-#         # effectors
-#         self.gear = 1; self.accel = self.brake = self.steer = 0.0
-#         self.clutch = 0.0; self.meta = 0; self.focus_angle = 0
+#         # effectors / helpers
+#         self.gear = 1                      # the gear *we* command each tick
+#         self.steer = self.accel = self.brake = 0.0
+#         self.clutch = 0.0
+#         self.meta = 0                      # reset command
+#         self.focus_angle = 0
+#         self.last_focus_time = 0.0
+#         self.stuck_timer = 0.0
+#         self.steering_scale = 1.0          # speed-sensitive steering helper
 
-#         # helpers
-#         self.prev_gear = 1; self.last_focus_time = 0.0
-#         self.stuck_timer = 0.0; self.steering_scale = 1.0
+#         # static info
+#         self.track_name, self.car_model = self._get_track_and_car()
 
-#         # --- ML model ---------------------------------------------------------
+#         # ML model (optional)
 #         self.model = None
-#         if os.path.isfile(MODEL_PATH):
-#             try:
-#                 self.model = joblib.load(MODEL_PATH)
-#                 print(f"[ML] Loaded model: {MODEL_PATH}")
-#             except Exception as e:
-#                 print(f"[ML] Could not load model ({e}) – fallback to keyboard.")
+#         if USE_ML and os.path.isfile(MODEL_FILE) and os.path.isfile(PREPROC_FILE):
+#             self.scaler_stats, self.cat_maps = load_preproc(PREPROC_FILE)
+#             emb = {k: max(m.values()) + 1 for k, m in self.cat_maps.items()}
+#             self.model = build_mlp(len(ALL_NUM), emb)
+#             self.model.load_state_dict(torch.load(MODEL_FILE, map_location="cpu"))
+#             self.model.eval()
+#             print("[ML] model loaded ✔")
 
-#         # track / car info
-#         self.track_name, self.driver_module, self.car_model = self.get_track_driver_car()
-
-#         # --- CSV logger -------------------------------------------------------
-#         file_exists = os.path.isfile("driving_data.csv")
-#         self.logfile = open("driving_data.csv", "a", newline="")
+#         # CSV logger
+#         log_fn = self._make_log_filename()
+#         self.logfile = open(log_fn, "a", newline="")
 #         self.logger  = csv.writer(self.logfile)
-#         if not file_exists:
+#         if self.logfile.tell() == 0:
 #             self.logger.writerow([
-#                 "track","driver","car",
-#                 "speedX","speedY","speedZ","angle","curLapTime","damage",
-#                 "distFromStart","distRaced","focus","fuel","gear","lastLapTime",
-#                 "opponents","racePos","rpm","track","trackPos","wheelSpinVel","z",
-#                 "steering","accel","brake","clutch","meta","focusCmd",
-#                 "left_key","right_key","up_key","down_key","r_key"
+#                 "track", "car", *ALL_NUM,
+#                 "steering", "accel", "brake",
+#                 "clutch", "meta", "focusCmd",
+#                 "is_ml", "left", "right", "up", "down", "r",
+#                 "commandedGear"        # extra debugging column
 #             ])
+#         print(f"[LOG] → {log_fn}")
 
-#     # ──────────────────────────────────────────────────────────
-#     def get_track_driver_car(self):
-#         try:
-#             base = r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs"
-#             qxml = os.path.join(base, "config/raceman/quickrace.xml")
-#             t = ET.parse(qxml); r = t.getroot()
-
-#             track = r.find(".//section[@name='Tracks']/section")
-#             track_name = track.find("attstr[@name='name']").attrib['val'] if track is not None else "unknown"
-
-#             dsec = r.find(".//section[@name='Drivers']")
-#             idx  = dsec.find("attnum[@name='focused idx']").attrib['val'] if dsec is not None else "0"
-#             mod  = dsec.find("attstr[@name='focused module']").attrib['val'] if dsec is not None else "unknown"
-
-#             scr = os.path.join(base, "drivers", mod, "scr_server.xml")
-#             r2  = ET.parse(scr).getroot()
-#             rob = r2.find(f".//section[@name='Robots']/section[@name='index']/section[@name='{idx}']")
-#             if rob is None:
-#                 rob = r2.find(".//section[@name='Robots']/section[@name='index']/section")
-#             car = rob.find("attstr[@name='car name']").attrib['val'] if rob is not None else "unknown_car"
-#             return track_name, mod, car
-#         except Exception as e:
-#             print(f"[XML] {e}")
-#             return "unknown","unknown","unknown"
-
-#     # ──────────────────────────────────────────────────────────
+#     # ───────────────── TORCS handshake ─────────────────
 #     def init(self):
 #         ang = [0]*19
-#         for i in range(5):
-#             ang[i] = -90+i*15; ang[18-i] = 90-i*15
-#         for i in range(5,9):
-#             ang[i] = -20+(i-5)*5; ang[18-i] = 20-(i-5)*5
+#         for i in range(5):   ang[i]    = -90 + i*15;  ang[18-i] =  90 - i*15
+#         for i in range(5,9): ang[i]    = -20 + (i-5)*5; ang[18-i] = 20 - (i-5)*5
 #         return self.parser.stringify({'init': ang})
 
-#     # ──────────────────────────────────────────────────────────
+#     # ───────────────── main loop ───────────────────────
 #     def drive(self, msg):
-#         self.state.setFromMsg(msg)
+#         s = self.state; s.setFromMsg(msg)
+#         self.meta = 0
 
-#         # ---------------- sensor shortcuts -------------------
-#         speedX  = self.state.getSpeedX() or 0
-#         angle   = self.state.getAngle()  or 0
-#         trackP  = self.state.getTrackPos() or 0
-#         rpm     = self.state.getRpm()    or 0
-#         curLap  = self.state.getCurLapTime() or 0.0
+#         # ───── read keyboard ─────
+#         kp = keyboard.is_pressed
+#         l, r, u, d, rst = (kp('left'), kp('right'), kp('up'),
+#                            kp('down'), kp('r'))
+#         manual_keys = any([l, r, u, d])
+#         ml_active = USE_ML and self.model and not manual_keys
 
-#         # ---------------- keyboard override ------------------
-#         l = keyboard.is_pressed
-#         left_k  = 1 if l('left')  else 0
-#         right_k = 1 if l('right') else 0
-#         up_k    = 1 if l('up')    else 0
-#         down_k  = 1 if l('down')  else 0
-#         r_k     = 1 if l('r')     else 0
+#         # ───── simulator-reported sensors (for logging & ML) ─────
+#         sim_speedX = s.getSpeedX() or 0.0
+#         sim_speedY = s.getSpeedY() or 0.0
+#         sim_speedZ = s.getSpeedZ() or 0.0
+#         sim_angle  = s.getAngle()  or 0.0
+#         sim_trackPos = s.getTrackPos() or 0.0
+#         sim_rpm   = s.getRpm()    or 0.0
+#         sim_gear  = s.getGear()   or 0     # *actual* gear in TORCS
+#         sim_distRaced = s.getDistRaced() or 0.0
+#         sim_damage    = s.getDamage()    or 0.0
+#         sim_track     = s.getTrack()     or [0]*19
+#         sim_focus     = s.getFocus()     or [0]*5
+#         sim_wheelSpin = s.getWheelSpinVel() or [0]*4
+#         sim_opps      = s.getOpponents()    or [0]*36
 
-#         # ------------------------------------------------------------------
-#         #   1)  get ML prediction
-#         # ------------------------------------------------------------------
-#         if self.model is not None and not any([left_k,right_k,up_k,down_k]):
-#             feat = np.array([[speedX, angle, trackP, rpm]])
-#             steer_pred, accel_pred, brake_pred = self.model.predict(feat)[0]
-#             # clamp to legal ranges
-#             self.steer  = float(np.clip(steer_pred, -1, 1))
-#             self.accel  = float(np.clip(accel_pred,  0, 1))
-#             self.brake  = float(np.clip(brake_pred,  0, 1))
+#         speed = math.sqrt(sim_speedX**2 + sim_speedY**2 + sim_speedZ**2)
+#         track_pos = sim_trackPos
+
+#         # ───── compute *commanded* gear & clutch ─────
+#         prev_cmd_gear = self.gear
+#         cmd_gear = prev_cmd_gear
+
+#         # Simple speed-based auto box (feel free to swap for RPM scheme)
+#         if sim_gear >= 0:                            # forward
+#             speed_up   = [0,  50, 100, 150, 200, 250]
+#             speed_down = [0,  30,  70, 120, 170, 220]
+#             if sim_gear < 5 and sim_speedX > speed_up[sim_gear]:
+#                 cmd_gear = sim_gear + 1
+#             elif sim_gear > 1 and sim_speedX < speed_down[sim_gear]:
+#                 cmd_gear = sim_gear - 1
+#             elif sim_gear <= 0 and self.accel > 0.1:         # N/R -> 1
+#                 cmd_gear = 1
+
+#         # clutch: engage while changing gear or shifting out of neutral
+#         shifting = cmd_gear != prev_cmd_gear and prev_cmd_gear != 0
+#         clutch_needed = shifting or (sim_gear == 0 and cmd_gear > 0)
+#         self.clutch = 1.0 if clutch_needed else 0.0
+#         self.gear   = cmd_gear                       # store for this tick
+
+#         # ───── dictionary used by ML & CSV (NOTE: real gear/rpm) ─────
+#         sensors = {
+#             "speedX": sim_speedX, "speedY": sim_speedY, "speedZ": sim_speedZ,
+#             "angle":  sim_angle, "trackPos": sim_trackPos,
+#             "rpm":    sim_rpm,                     # ← REAL RPM
+#             "gear":   sim_gear,                    # ← REAL GEAR
+#             "distRaced": sim_distRaced, "damage": sim_damage,
+#             **{f"track{i}": v for i, v in enumerate(sim_track)},
+#             **{f"focus{i}": v for i, v in enumerate(sim_focus)},
+#             **{f"wheelSpinVel{i}": v for i, v in enumerate(sim_wheelSpin)},
+#             **{f"opponents{i}": v for i, v in enumerate(sim_opps)}
+#         }
+
+#         # ───── choose controls ─────
+#         if ml_active:
+#             self.accel = self.brake = 0.0
+#             num = torch.from_numpy(np.asarray(
+#                     [scale_row(sensors, self.scaler_stats)], dtype=np.float32))
+#             cat = torch.tensor([[ self.cat_maps["track_name"].get(self.track_name, 0),
+#                                   self.cat_maps["car_name"].get(self.car_model, 0) ]])
+#             with torch.no_grad():
+#                 steer, acc, brk = self.model(num, cat)[0].numpy()
+
+#             if acc > brk: brk = 0.0
+#             else:        acc = 0.0
+#             if speed < TARGET_SPEED_LOW and brk > 0.1: brk = 0.0
+
+#             self.steer = float(np.clip(steer, -1, 1))
+#             self.accel = float(np.clip(acc,   0, 1))
+#             self.brake = float(np.clip(brk,   0, 1))
+#         else:  # keyboard / simple heuristic
+#             self.steer = 0.8*self.steer + 0.2*( self.steering_scale if l else
+#                                                  -self.steering_scale if r else 0.0)
+#             if u: self.accel = min(self.accel + 0.03, 1.0)
+#             else: self.accel = max(self.accel - 0.10, 0.0)
+#             if d: self.brake = 1.0; self.accel = 0.0
+#             else: self.brake = 0.0
+
+#         # ───── focus rays ─────
+#         if FOCUS_ACTIVE:
+#             lap = s.getCurLapTime() or 0.0
+#             if lap - self.last_focus_time >= 1.0:
+#                 self.focus_angle = 15 if self.steer>0.05 else -15 if self.steer<-0.05 else 0
+#                 self.last_focus_time = lap
 #         else:
-#             # ----------------------------------------------------------------
-#             #   2)  manual / simple logic (same as before)
-#             # ----------------------------------------------------------------
-#             target_steer = self.steering_scale if left_k else (-self.steering_scale if right_k else 0.0)
-#             self.steer   = 0.8*self.steer + 0.2*target_steer
-
-#             if down_k and speedX < 1:
-#                 self.accel = 0.5; self.gear = -1
-#             elif up_k:
-#                 self.accel = 1.0
-#                 if self.gear < 1: self.gear = 1
-#             elif down_k:
-#                 self.brake = 1.0
-
-#         # ---------------- basic speed→gear heuristic -------------
-#         if self.gear != -1:
-#             self.gear = min(6, max(1, int(speedX//50)+1))
-
-#         # ---------------- clutch on gear change -----------------
-#         self.clutch = 1.0 if self.gear != self.prev_gear else 0.0
-#         self.prev_gear = self.gear
-
-#         # ---------------- focus sensor sweep -------------------
-#         if curLap - self.last_focus_time >= 1.0:
-#             self.focus_angle =  15 if self.steer > 0.05 else (-15 if self.steer < -0.05 else 0)
-#             self.last_focus_time = curLap
+#             self.focus_angle = 0
 #         self.control.setFocus(self.focus_angle)
 
-#         # ---------------- auto restart -------------------------
-#         if r_k:
+#         # ───── auto reset ─────
+#         if rst:
 #             self.meta = 1
-#         elif speedX < 2:
+#         elif (ENABLE_AUTO_RESET and speed < 0.5 and abs(track_pos) > 1.2
+#               and self.accel < 0.05 and self.brake < 0.05):
 #             self.stuck_timer += 0.02
-#             if self.stuck_timer > 5:
-#                 self.meta = 1; self.stuck_timer = 0
-#         else: self.stuck_timer = 0
+#             if self.stuck_timer >= STUCK_SECONDS:
+#                 self.meta = 1; self.stuck_timer = 0.0
+#         else:
+#             self.stuck_timer = 0.0
 
-#         # ---------------- send to TORCS ------------------------
+#         # ───── send to TORCS ─────
 #         self.control.setGear(self.gear)
 #         self.control.setAccel(self.accel)
 #         self.control.setBrake(self.brake)
@@ -155,414 +197,258 @@
 #         self.control.setClutch(self.clutch)
 #         self.control.setMeta(self.meta)
 
-#         # ---------------- CSV log ------------------------------
-#         try:
-#             self.logger.writerow([
-#                 self.track_name, self.driver_module, self.car_model,
-#                 self.state.getSpeedX(), self.state.getSpeedY(), self.state.getSpeedZ(),
-#                 angle, self.state.getCurLapTime(), self.state.getDamage(),
-#                 self.state.getDistFromStart(), self.state.getDistRaced(),
-#                 str(self.state.getFocus()), self.state.getFuel(), self.state.getGear(),
-#                 self.state.getLastLapTime(), str(self.state.getOpponents()),
-#                 self.state.getRacePos(), rpm, str(self.state.getTrack()),
-#                 trackP, str(self.state.getWheelSpinVel()), self.state.getZ(),
-#                 self.steer, self.accel, self.brake, self.clutch, self.meta, self.focus_angle,
-#                 left_k, right_k, up_k, down_k, r_k
-#             ])
-#         except Exception as e:
-#             print(f"[Log] {e}")
+#         # ───── CSV log (real gear/rpm!) ─────
+#         self.logger.writerow([
+#             self.track_name, self.car_model,
+#             *[sensors[c] for c in ALL_NUM],
+#             self.steer, self.accel, self.brake,
+#             self.clutch, self.meta, self.focus_angle,
+#             int(ml_active), int(l), int(r), int(u), int(d), int(rst),
+#             self.gear                                  # commandedGear column
+#         ])
+#         self.logfile.flush()  # ensure values appear immediately
 
-#         print(f"[SEND] st={self.steer:+.2f} ac={self.accel:.2f} br={self.brake:.2f} g={self.gear} ml={'Y' if self.model else 'N'}")
+#         if self.meta: self.meta = 0
 #         return self.control.toMsg()
 
-#     # ──────────────────────────────────────────────────────────
+#     # ───────── helpers ─────────
 #     def onShutDown(self):
-#         self.logfile.close()
+#         if self.logfile:
+#             self.logfile.close()
+#             print("[LOG] closed.")
 
-#     def onRestart(self): pass
+#     def onRestart(self):
+#         self.gear = 1
+#         self.steer = self.accel = self.brake = 0.0
+#         self.clutch = 0.0
+#         self.stuck_timer = 0.0
+#         print("[Driver] Restarted, state reset.")
 
+#     # simplified; replace with XML parsing if desired
+#     def _get_track_and_car(self):
+#         return "unknown_track", "unknown_car"
 
-
-
-# # driver.py ------------------------------------------------------------
-# # TORCS client that loads torch model with rich sensor set
-# import msgParser, carState, carControl, keyboard
-# import csv, os, xml.etree.ElementTree as ET, numpy as np, torch
-# from utils import load_preproc, scale_row, ALL_NUM
-
-# MODEL_FN   = "torcs_model.pt"
-# PREPROC_FN = "preproc.pkl"
-
-# class Driver(object):
-#     # ──────────────────────────────────────────────────────────
-#     def __init__(self, stage):
-#         self.stage   = stage
-#         self.parser  = msgParser.MsgParser()
-#         self.state   = carState.CarState()
-#         self.control = carControl.CarControl()
-
-#         # effectors
-#         self.gear = 1; self.accel = self.brake = self.steer = 0.0
-#         self.clutch = 0.0; self.meta = 0; self.focus_angle = 0
-
-#         # helpers
-#         self.prev_gear = 1; self.last_focus_time = 0.0
-#         self.stuck_timer = 0.0; self.steering_scale = 1.0
-
-#         # load track / car labels
-#         self.track_name, self.driver_module, self.car_model = self._get_track_info()
-
-#         # ----- ML model ------------------------------------------------------
-#         self.model, self.scaler_stats, self.cat_maps = None, None, None
-#         if os.path.isfile(MODEL_FN) and os.path.isfile(PREPROC_FN):
-#             from train_torch import MLP
-#             try:
-#                 self.scaler_stats, self.cat_maps = load_preproc(PREPROC_FN)
-#                 self.model = MLP()
-#                 self.model.load_state_dict(torch.load(MODEL_FN, map_location="cpu"))
-#                 self.model.eval()
-#                 print("[ML] neural model loaded")
-#             except Exception as e:
-#                 print("[ML] load error:", e)
-
-#         # ----- CSV logging ---------------------------------------------------
-#         fexists = os.path.isfile("driving_data.csv")
-#         self.logfile = open("driving_data.csv", "a", newline="")
-#         self.logger  = csv.writer(self.logfile)
-#         if not fexists:
-#             self.logger.writerow([
-#                 "track","driver","car",
-#                 *ALL_NUM,
-#                 "steering","accel","brake","clutch","meta","focusCmd",
-#                 "left_key","right_key","up_key","down_key","r_key"
-#             ])
-
-#     # ──────────────────────────────────────────────────────────
-#     def _get_track_info(self):
-#         try:
-#             base = r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs"
-#             qxml = os.path.join(base, "config/raceman/quickrace.xml")
-#             root = ET.parse(qxml).getroot()
-#             tsec = root.find(".//section[@name='Tracks']/section")
-#             track = tsec.find("attstr[@name='name']").attrib['val'] if tsec is not None else "unknown"
-#             dsec = root.find(".//section[@name='Drivers']")
-#             idx  = dsec.find("attnum[@name='focused idx']").attrib['val'] if dsec is not None else "0"
-#             mod  = dsec.find("attstr[@name='focused module']").attrib['val'] if dsec is not None else "unknown"
-#             scr  = os.path.join(base,"drivers",mod,"scr_server.xml")
-#             r2   = ET.parse(scr).getroot()
-#             rob  = r2.find(f".//section[@name='Robots']/section[@name='index']/section[@name='{idx}']") \
-#                    or r2.find(".//section[@name='Robots']/section[@name='index']/section")
-#             car  = rob.find("attstr[@name='car name']").attrib['val'] if rob is not None else "unknown_car"
-#             return track, mod, car
-#         except Exception as e:
-#             print("[XML]", e); return "unknown","unknown","unknown"
-
-#     # ──────────────────────────────────────────────────────────
-#     def init(self):
-#         ang = [0]*19
-#         for i in range(5):
-#             ang[i] = -90+i*15; ang[18-i] = 90-i*15
-#         for i in range(5,9):
-#             ang[i] = -20+(i-5)*5; ang[18-i] = 20-(i-5)*5
-#         return self.parser.stringify({'init': ang})
-
-#     # ──────────────────────────────────────────────────────────
-#     def drive(self, msg):
-#         self.state.setFromMsg(msg)
-
-#         # ----- gather sensor dict -------------------------------------------
-#         s = self.state
-#         sensors = {
-#             "speedX": s.getSpeedX() or 0.0,
-#             "speedY": s.getSpeedY() or 0.0,
-#             "speedZ": s.getSpeedZ() or 0.0,
-#             "angle":  s.getAngle()  or 0.0,
-#             "trackPos": s.getTrackPos() or 0.0,
-#             "rpm":    s.getRpm()    or 0.0,
-#             "gear":   s.getGear()   or 0,
-#             "distRaced": s.getDistRaced() or 0.0,
-#             "damage": s.getDamage() or 0.0,
-#             **{f"track{i}": v for i,v in enumerate((s.getTrack() or [0]*19))},
-#             **{f"focus{i}": v for i,v in enumerate((s.getFocus() or [0]*5))},
-#             **{f"wheelSpinVel{i}": v for i,v in enumerate((s.getWheelSpinVel() or [0]*4))},
-#             **{f"opponents{i}": v for i,v in enumerate((s.getOpponents() or [0]*36))}
-#         }
-
-#         # ----- keyboard override keys ---------------------------------------
-#         k = keyboard.is_pressed
-#         left_k  = 1 if k('left')  else 0
-#         right_k = 1 if k('right') else 0
-#         up_k    = 1 if k('up')    else 0
-#         down_k  = 1 if k('down')  else 0
-#         r_k     = 1 if k('r')     else 0
-#         manual  = any([left_k,right_k,up_k,down_k])
-
-#         # --------------------------------------------------------------------
-#         if self.model and not manual:
-#             num = torch.tensor([scale_row(sensors, self.scaler_stats)])
-#             cat = torch.tensor([[ self.cat_maps["track_name"].get(self.track_name,0),
-#                                   self.cat_maps["car_name"].get(self.car_model,0) ]])
-#             with torch.no_grad():
-#                 steer, accel, brake = self.model(num, cat)[0].numpy().tolist()
-#             self.steer = float(np.clip(steer,-1,1))
-#             self.accel = float(np.clip(accel,0,1))
-#             self.brake = float(np.clip(brake,0,1))
-#         else:
-#             tgt = self.steering_scale if left_k else (-self.steering_scale if right_k else 0.0)
-#             self.steer = 0.8*self.steer + 0.2*tgt
-#             if down_k and sensors["speedX"] < 1:
-#                 self.accel, self.gear = 0.5, -1
-#             elif up_k:
-#                 self.accel = 1.0; self.gear = max(1, self.gear)
-#             elif down_k: self.brake = 1.0
-
-#         # ----- simple gear heuristic & clutch -------------------------------
-#         if self.gear != -1:
-#             self.gear = min(6, max(1, int(sensors["speedX"]//50)+1))
-#         self.clutch = 1.0 if self.gear != self.prev_gear else 0.0
-#         self.prev_gear = self.gear
-
-#         # ----- focus ray sweep ----------------------------------------------
-#         curLap = s.getCurLapTime() or 0.0
-#         if curLap - self.last_focus_time >= 1.0:
-#             self.focus_angle =  15 if self.steer > 0.05 else (-15 if self.steer < -0.05 else 0)
-#             self.last_focus_time = curLap
-#         self.control.setFocus(self.focus_angle)
-
-#         # ----- meta restart (stuck or 'r') ----------------------------------
-#         if r_k: self.meta = 1
-#         elif sensors["speedX"] < 2:
-#             self.stuck_timer += 0.02
-#             if self.stuck_timer > 5: self.meta, self.stuck_timer = 1, 0
-#         else: self.stuck_timer = 0
-
-#         # ----- send to TORCS -------------------------------------------------
-#         self.control.setGear(self.gear)
-#         self.control.setAccel(self.accel); self.control.setBrake(self.brake)
-#         self.control.setSteer(self.steer); self.control.setClutch(self.clutch)
-#         self.control.setMeta(self.meta)
-
-#         # ----- logging -------------------------------------------------------
-#         try:
-#             self.logger.writerow([
-#                 self.track_name, self.driver_module, self.car_model,
-#                 *[sensors[c] for c in ALL_NUM],
-#                 self.steer, self.accel, self.brake, self.clutch, self.meta, self.focus_angle,
-#                 left_k, right_k, up_k, down_k, r_k
-#             ])
-#         except Exception as e:
-#             print("[Log]", e)
-
-#         print(f"[SEND] st={self.steer:+.2f} ac={self.accel:.2f} br={self.brake:.2f} "
-#               f"g={self.gear} ml={'Y' if self.model and not manual else 'N'}")
-#         return self.control.toMsg()
-
-#     # ──────────────────────────────────────────────────────────
-#     def onShutDown(self): self.logfile.close()
-#     def onRestart(self):  pass
+#     def _make_log_filename(self):
+#         slug = lambda x: re.sub(r"[^A-Za-z0-9_.-]", "", x)
+#         t, c = slug(self.track_name), slug(self.car_model)
+#         if t and c and t not in ["unknown_track"] and c not in ["unknown_car"]:
+#             base = f"{t}_{c}"
+#             return f"{base}_{len(glob.glob(base + '_*.csv')) + 1:02}.csv"
+#         return "driving_data.csv"
 
 
-# driver.py -------------------------------------------------------------------
-# SET THIS FLAG to choose default behaviour
-USE_ML = False          # True = let neural model drive by default
-                       # False = heuristic/manual only
 
-import os, csv, glob, re, xml.etree.ElementTree as ET
-import numpy as np, torch, keyboard, msgParser, carState, carControl
-from utils import load_preproc, scale_row, ALL_NUM
+# driver.py  — hybrid TORCS client (ML + keyboard)  ⚙️
+# ---------------------------------------------------------------------
+#  ‼️  Gear-, RPM-, and clutch-free version
+#  •  We never decide gears or clutch ourselves.
+#  •  Each tick we send   setGear(0)   → TORCS shifts automatically.
+#  •  We ONLY *record* the gear and rpm reported by the simulator and
+#     write them to the CSV exactly as-is.
+# ---------------------------------------------------------------------
+
+# ───────── configuration ─────────
+USE_ML            = False      # False → keyboard / heuristic only
+FOCUS_ACTIVE      = False
+ENABLE_AUTO_RESET = True
+STUCK_SECONDS     = 15.0
+TARGET_SPEED_LOW  = 5.0        # m/s – below this we suppress ML brake
 
 MODEL_FILE   = "torcs_model.pt"
 PREPROC_FILE = "preproc.pkl"
 
+# ───────── imports ───────────────
+import os, csv, glob, re, math, xml.etree.ElementTree as ET
+import numpy as np, torch, keyboard, msgParser, carState, carControl
+from utils  import load_preproc, scale_row, ALL_NUM
+from models import build_mlp
 
-class Driver(object):
 
-    # ──────────────────────────────────────────────────────────────────
-    def __init__(self, stage):
-        # core objects
-        self.stage = stage
-        self.parser = msgParser.MsgParser()
-        self.state  = carState.CarState()
+class Driver:
+    # ───────────────────────── init ──────────────────────────
+    def __init__(self, stage: int):
+        self.stage   = stage
+        self.parser  = msgParser.MsgParser()
+        self.state   = carState.CarState()
         self.control = carControl.CarControl()
 
-        # effectors
-        self.gear = 1
+        # effectors we still control
         self.steer = self.accel = self.brake = 0.0
-        self.clutch = 0.0
-        self.meta   = 0
+        self.meta  = 0
         self.focus_angle = 0
-
-        # helpers
-        self.prev_gear = 1
         self.last_focus_time = 0.0
-        self.stuck_timer = 0.0
-        self.steering_scale = 1.0
+        self.stuck_timer     = 0.0
+        self.steering_scale  = 1.0
 
-        # track & car info
+        # static info
         self.track_name, self.car_model = self._get_track_and_car()
 
-        # ML model
+        # optional ML model
         self.model = None
-        self.scaler_stats = None
-        self.cat_maps = None
         if USE_ML and os.path.isfile(MODEL_FILE) and os.path.isfile(PREPROC_FILE):
-            from train_model import MLP  # reuse class
             self.scaler_stats, self.cat_maps = load_preproc(PREPROC_FILE)
-            self.model = MLP()
+            emb = {k: max(m.values())+1 for k, m in self.cat_maps.items()}
+            self.model = build_mlp(len(ALL_NUM), emb)
             self.model.load_state_dict(torch.load(MODEL_FILE, map_location="cpu"))
             self.model.eval()
-            print("[ML] Model loaded ✔")
+            print("[ML] model loaded ✔")
 
         # CSV logger
-        csv_name = self._make_log_filename()
-        self.logfile = open(csv_name, "a", newline="")
+        log_fn = self._make_log_filename()
+        self.logfile = open(log_fn, "a", newline="")
         self.logger  = csv.writer(self.logfile)
         if self.logfile.tell() == 0:
             self.logger.writerow([
-                "track", "car", *ALL_NUM,
-                "steering", "accel", "brake",
-                "clutch", "meta", "focusCmd",
-                "is_ml", "left_key", "right_key", "up_key", "down_key", "r_key"
+                "track","car",*ALL_NUM,
+                "steering","accel","brake",
+                "meta","focusCmd",
+                "is_ml","left","right","up","down","r"
             ])
-        print(f"[LOG] Writing to {csv_name}")
+        print(f"[LOG] → {log_fn}")
 
-    # ──────────────────────────────────────────────────────────────────
-    # TORCS required init sensor angles
+    # ───────────────────────── TORCS handshake ───────────────────────
     def init(self):
-        ang = [0] * 19
-        for i in range(5):
-            ang[i] = -90 + i * 15
-            ang[18 - i] = 90 - i * 15
-        for i in range(5, 9):
-            ang[i] = -20 + (i - 5) * 5
-            ang[18 - i] = 20 - (i - 5) * 5
+        ang = [0]*19
+        for i in range(5):   ang[i]    = -90+i*15;  ang[18-i] =  90-i*15
+        for i in range(5,9): ang[i]    = -20+(i-5)*5; ang[18-i] = 20-(i-5)*5
         return self.parser.stringify({'init': ang})
 
-    # ──────────────────────────────────────────────────────────────────
-    # Main driving loop
+    # ───────────────────────── main loop ──────────────────────────────
     def drive(self, msg):
+        s = self.state; s.setFromMsg(msg)
+        self.meta = 0
 
-        # ---------- set sensors ----------
-        s = self.state
-        s.setFromMsg(msg)
-        sen = {
-            "speedX": s.getSpeedX() or 0.0,
-            "speedY": s.getSpeedY() or 0.0,
-            "speedZ": s.getSpeedZ() or 0.0,
-            "angle":  s.getAngle()  or 0.0,
-            "trackPos": s.getTrackPos() or 0.0,
-            "rpm":    s.getRpm()    or 0.0,
-            "gear":   s.getGear()   or 0,
-            "distRaced": s.getDistRaced() or 0.0,
-            "damage": s.getDamage() or 0.0,
-            **{f"track{i}": v for i, v in enumerate(s.getTrack() or [0]*19)},
-            **{f"focus{i}": v for i, v in enumerate(s.getFocus() or [0]*5)},
-            **{f"wheelSpinVel{i}": v for i, v in enumerate(s.getWheelSpinVel() or [0]*4)},
-            **{f"opponents{i}": v for i, v in enumerate(s.getOpponents() or [0]*36)}
-        }
+        # 1) keyboard
+        kp = keyboard.is_pressed
+        left,right,up_key,down_key,rst = (kp('left'),kp('right'),
+                                          kp('up'),kp('down'),kp('r'))
+        manual_keys = any([left,right,up_key,down_key])
+        ml_active = USE_ML and self.model and not manual_keys
 
-        # ---------- keyboard ----------
-        k = keyboard.is_pressed
-        l, r, u, d, rst = (k('left'), k('right'), k('up'),
-                           k('down'), k('r'))
-        manual_override = any([l, r, u, d])
-        ml_active = USE_ML and self.model and not manual_override
+        # 2) simulator sensors (gear & rpm come straight from TORCS)
+        sim_speedX = s.getSpeedX() or 0.0
+        sim_speedY = s.getSpeedY() or 0.0
+        sim_speedZ = s.getSpeedZ() or 0.0
+        sim_angle  = s.getAngle()  or 0.0
+        sim_trackPos = s.getTrackPos() or 0.0
+        sim_rpm   = s.getRpm()    or 0.0       # ← record only
+        sim_gear  = s.getGear()   or 0         # ← record only
+        sim_distRaced = s.getDistRaced() or 0.0
+        sim_damage    = s.getDamage()    or 0.0
+        sim_track     = s.getTrack()     or [0]*19
+        sim_focus     = s.getFocus()     or [0]*5
+        sim_wheelSpin = s.getWheelSpinVel() or [0]*4
+        sim_opps      = s.getOpponents()    or [0]*36
 
-        # ---------- control ----------
+        speed = math.sqrt(sim_speedX**2 + sim_speedY**2 + sim_speedZ**2)
+        track_pos = sim_trackPos
+
+        # 3) choose steering/throttle/brake (no clutch/gear logic)
         if ml_active:
-            num = torch.tensor([scale_row(sen, self.scaler_stats)])
-            cat = torch.tensor([[self.cat_maps["track_name"].get(self.track_name, 0),
-                                 self.cat_maps["car_name"].get(self.car_model, 0)]])
+            self.accel = self.brake = 0.0
+            sensors_for_ml = {
+                **{ "speedX":sim_speedX,"speedY":sim_speedY,"speedZ":sim_speedZ,
+                    "angle":sim_angle,"trackPos":sim_trackPos,
+                    "rpm":sim_rpm,"gear":sim_gear,
+                    "distRaced":sim_distRaced,"damage":sim_damage},
+                **{f"track{i}":v for i,v in enumerate(sim_track)},
+                **{f"focus{i}":v for i,v in enumerate(sim_focus)},
+                **{f"wheelSpinVel{i}":v for i,v in enumerate(sim_wheelSpin)},
+                **{f"opponents{i}":v for i,v in enumerate(sim_opps)}
+            }
+            num = torch.from_numpy(np.asarray(
+                [scale_row(sensors_for_ml, self.scaler_stats)], dtype=np.float32))
+            cat = torch.tensor([[ 
+                self.cat_maps["track_name"].get(self.track_name,0),
+                self.cat_maps["car_name"].get(self.car_model,0)
+            ]])
             with torch.no_grad():
-                self.steer, self.accel, self.brake = self.model(num, cat)[0].numpy().tolist()
-            self.steer = float(np.clip(self.steer, -1, 1))
-            self.accel = float(np.clip(self.accel, 0, 1))
-            self.brake = float(np.clip(self.brake, 0, 1))
+                st, ac, br = self.model(num, cat)[0].numpy()
+            if ac > br: br = 0.0
+            else:       ac = 0.0
+            if speed < TARGET_SPEED_LOW and br > 0.1: br = 0.0
+            self.steer = float(np.clip(st,-1,1))
+            self.accel = float(np.clip(ac,0,1))
+            self.brake = float(np.clip(br,0,1))
         else:
-            tgt = self.steering_scale if l else (-self.steering_scale if r else 0.0)
-            self.steer = 0.8 * self.steer + 0.2 * tgt
-            if d and sen["speedX"] < 1:
-                self.accel, self.gear = 0.5, -1
-            elif u:
-                self.accel = 1.0
-                self.gear = max(1, self.gear)
-            elif d:
-                self.brake = 1.0
+            self.steer = 0.8*self.steer + 0.2*(
+                self.steering_scale if left else
+                -self.steering_scale if right else 0.0)
+            if up_key:   self.accel = min(self.accel+0.03,1.0)
+            else:        self.accel = max(self.accel-0.10,0.0)
+            if down_key:
+                self.brake = 1.0; self.accel = 0.0
+            else:
+                self.brake = 0.0
 
-        # ---------- gear & clutch ----------
-        if self.gear != -1:
-            self.gear = min(6, max(1, int(sen["speedX"] // 50) + 1))
-        self.clutch = 1.0 if self.gear != self.prev_gear else 0.0
-        self.prev_gear = self.gear
-
-        # ---------- focus sweep ----------
-        lap = s.getCurLapTime() or 0.0
-        if lap - self.last_focus_time >= 1.0:
-            self.focus_angle = 15 if self.steer > 0.05 else -15 if self.steer < -0.05 else 0
-            self.last_focus_time = lap
+        # 4) focus rays (optional)
+        if FOCUS_ACTIVE:
+            lap = s.getCurLapTime() or 0.0
+            if lap - self.last_focus_time >= 1.0:
+                self.focus_angle = 15 if self.steer>0.05 else -15 if self.steer<-0.05 else 0
+                self.last_focus_time = lap
+        else:
+            self.focus_angle = 0
         self.control.setFocus(self.focus_angle)
 
-        # ---------- meta restart ----------
+        # 5) auto‐reset
         if rst:
             self.meta = 1
-        elif sen["speedX"] < 2:
+        elif (ENABLE_AUTO_RESET and speed<0.5 and abs(track_pos)>1.2
+              and self.accel<0.05 and self.brake<0.05):
             self.stuck_timer += 0.02
+            if self.stuck_timer >= STUCK_SECONDS:
+                self.meta = 1; self.stuck_timer = 0.0
         else:
             self.stuck_timer = 0.0
-        if self.stuck_timer > 5:
-            self.meta = 1
-            self.stuck_timer = 0.0
 
-        # ---------- send actions ----------
-        self.control.setGear(self.gear)
+        # 6) send to TORCS (gear/clutch always 0 = “auto”)
+        self.control.setGear(0)         # let TORCS shift
+        self.control.setClutch(0.0)     # clutch free
         self.control.setAccel(self.accel)
         self.control.setBrake(self.brake)
         self.control.setSteer(self.steer)
-        self.control.setClutch(self.clutch)
         self.control.setMeta(self.meta)
 
-        # ---------- log ----------
+        # 7) log (gear & rpm straight from simulator)
         self.logger.writerow([
             self.track_name, self.car_model,
-            *[sen[c] for c in ALL_NUM],
+            sim_speedX, sim_speedY, sim_speedZ,
+            sim_angle, sim_trackPos,
+            sim_rpm, sim_gear,                # ← exact values
+            sim_distRaced, sim_damage,
+            *[v for v in sim_track],
+            *[v for v in sim_focus],
+            *[v for v in sim_wheelSpin],
+            *[v for v in sim_opps],
             self.steer, self.accel, self.brake,
-            self.clutch, self.meta, self.focus_angle,
-            int(ml_active), int(l), int(r), int(u), int(d), int(rst)
+            self.meta, self.focus_angle,
+            int(ml_active),
+            int(left), int(right), int(up_key), int(down_key), int(rst)
         ])
+        self.logfile.flush()
 
+        if self.meta: self.meta = 0
         return self.control.toMsg()
 
-    # ──────────────────────────────────────────────────────────────────
+    # ───────── helpers ─────────
     def onShutDown(self):
-        self.logfile.close()
+        if self.logfile:
+            self.logfile.close()
+            print("[LOG] closed.")
 
     def onRestart(self):
-        pass
+        self.steer = self.accel = self.brake = 0.0
+        self.stuck_timer = 0.0
+        print("[Driver] Restarted.")
 
-    # ──────────────────────────────────────────────────────────────────
-    # helper: parse XML to find track & car
     def _get_track_and_car(self):
-        try:
-            base = r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs"
-            root = ET.parse(os.path.join(base, "config/raceman/quickrace.xml")).getroot()
-            track = root.find(".//section[@name='Tracks']/section/attstr[@name='name']").attrib['val']
-            drv   = root.find(".//section[@name='Drivers']")
-            idx   = drv.find("attnum[@name='focused idx']").attrib['val']
-            mod   = drv.find("attstr[@name='focused module']").attrib['val']
-            scr   = ET.parse(os.path.join(base, "drivers", mod, "scr_server.xml")).getroot()
-            rob   = scr.find(f".//section[@name='Robots']/section[@name='index']/section[@name='{idx}']") \
-                    or scr.find(".//section[@name='Robots']/section[@name='index']/section")
-            car   = rob.find("attstr[@name='car name']").attrib['val']
-            return track, car
-        except Exception:
-            return "unknown", "unknown_car"
+        return "unknown_track", "unknown_car"
 
-    # name like  <Track>_<Car>_<N>.csv
     def _make_log_filename(self):
-        def slug(x): return re.sub("[^A-Za-z0-9]", "", x)
+        slug = lambda x: re.sub(r"[^A-Za-z0-9_.-]", "", x)
         t, c = slug(self.track_name), slug(self.car_model)
-        if t and c and t != "unknown" and c != "unknowncar":
+        if t and c and t!="unknown_track" and c!="unknown_car":
             base = f"{t}_{c}"
-            idx  = len(glob.glob(f"{base}_*.csv")) + 1
-            return f"{base}_{idx:02}.csv"
+            return f"{base}_{len(glob.glob(base+'_*'))+1:02}.csv"
         return "driving_data.csv"
