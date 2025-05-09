@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 import os
 
 SCR_SERVER_PATH = r"C:\Users\ayaan\Documents\University\Semester 6\Aritificial Intelligence\Project\torcs\drivers\scr_server\scr_server.xml"
-NEW_CAR_NAME = "Peugeot 406"  # Change this to the desired car model
+NEW_CAR_NAME = "car1-trb1"  # Change this to the desired car model
 
 def update_car_model():
     try:
@@ -23,7 +23,7 @@ def update_car_model():
         print(f"Error updating car model: {e}")
 
 def main():
-    #update_car_model()  # Update the car before starting the client
+    update_car_model()  # Update the car before starting the client
 
     host_ip = "localhost"
     host_port = 3001
