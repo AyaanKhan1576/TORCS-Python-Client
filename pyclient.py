@@ -23,7 +23,7 @@ def update_car_model():
         print(f"Error updating car model: {e}")
 
 def main():
-    update_car_model()  # Update the car before starting the client
+    # update_car_model()  # Update the car before starting the client
 
     host_ip = "localhost"
     host_port = 3001
