@@ -268,7 +268,7 @@
 # ---------------------------------------------------------------------
 
 # ───────── configuration ─────────
-USE_ML            = True
+USE_ML            = False
 FOCUS_ACTIVE      = False
 ENABLE_AUTO_RESET = True
 STUCK_SECONDS     = 15.0
@@ -288,7 +288,7 @@ import os, csv, glob, re, math
 import numpy as np, torch, keyboard, msgParser, carState, carControl
 import xml.etree.ElementTree as ET
 from utils  import load_preproc, scale_row, ALL_NUM
-from models import build_mlp
+from models import TORCSModel
 
 
 class Driver:
@@ -308,7 +308,7 @@ class Driver:
         self.focus_angle   = 0
         self.last_focus_time = 0.0
         self.stuck_timer     = 0.0
-        self.steering_scale  = 1.0
+        self.steering_scale  = 0.1
 
         # static info
         self.track_name, self.car_model = self._get_track_and_car()
@@ -318,7 +318,7 @@ class Driver:
         if USE_ML and os.path.isfile(MODEL_FILE) and os.path.isfile(PREPROC_FILE):
             self.scaler_stats, self.cat_maps = load_preproc(PREPROC_FILE)
             emb = {k: max(m.values())+1 for k,m in self.cat_maps.items()}
-            self.model = build_mlp(len(ALL_NUM), emb)
+            self.model = TORCSModel(len(ALL_NUM), emb, seq_len=1)
             self.model.load_state_dict(torch.load(MODEL_FILE, map_location="cpu"))
             self.model.eval()
             print("[ML] model loaded ✔")
