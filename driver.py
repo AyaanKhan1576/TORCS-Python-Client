@@ -268,7 +268,7 @@
 # ---------------------------------------------------------------------
 
 # ───────── configuration ─────────
-USE_ML            = False
+USE_ML            = True
 FOCUS_ACTIVE      = False
 ENABLE_AUTO_RESET = True
 STUCK_SECONDS     = 15.0
