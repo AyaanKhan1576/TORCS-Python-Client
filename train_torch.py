@@ -1,4 +1,4 @@
-# train_torch.py
+# train_torch_seq.py
 import os, glob
 import numpy as np
 import pandas as pd
@@ -15,9 +15,11 @@ from utils import (
 from models import TORCSModel
 
 # ───── Hyperparameters ─────
-EPOCHS = 50
-BATCH  = 128
-LR     = 1e-3
+EPOCHS   = 20          # more epochs for sequence training
+BATCH    = 64          # moderate batch size
+LR       = 1e-3        # learning rate
+SEQ_LEN  = 5           # use past 5 frames to predict next control
+PENALTY  = 0.1         # weight for positional/angle penalty
 
 # ───── 1. Load & concatenate all CSVs ─────
 dfs = []
@@ -30,35 +32,52 @@ for fn in glob.glob("*.csv"):
 
     df = pd.read_csv(fn, low_memory=False)
     df = expand_lists(df)
-    df["track_name"] = track
-    df["car_name"]   = car
-
-    # convert to numeric, drop bad rows
     df[ALL_NUM + TARGETS] = df[ALL_NUM + TARGETS].apply(
         pd.to_numeric, errors="coerce"
     )
     df = df.dropna(subset=TARGETS)
     if df.empty:
         continue
-
     df[ALL_NUM] = df[ALL_NUM].fillna(0.0)
+    df['track_name'], df['car_name'] = track, car
     dfs.append(df)
 
 if not dfs:
     raise RuntimeError("No valid CSV data found!")
 
-df = pd.concat(dfs, ignore_index=True)
+full_df = pd.concat(dfs, ignore_index=True)
 
-# ───── 2. Preprocess ─────
-cat_idx, cat_maps = encode_categories(df)
-scaler_stats      = build_scaler(df)
+# ───── 2. Preprocess & encode ─────
+cat_idx, cat_maps = encode_categories(full_df)
+scaler_stats      = build_scaler(full_df)
 
-X_num = np.stack([scale_row(row, scaler_stats) for _, row in df.iterrows()])
-y      = df[TARGETS].to_numpy(dtype=np.float32)
+# build raw arrays
+X_num_all = np.stack([scale_row(row, scaler_stats) for _, row in full_df.iterrows()])
+y_all     = full_df[TARGETS].to_numpy(dtype=np.float32)
 
-# ───── 3. Train/Val split ─────
+# find indices for penalty features
+i_track = ALL_NUM.index('trackPos')
+i_angle = ALL_NUM.index('angle')
+
+# ───── 3. Sequence construction ─────
+def make_sequences(X_num, cat_idx, y, seq_len):
+    X_seq, C_seq, Y_seq = [], [], []
+    for i in range(len(X_num) - seq_len - 1):
+        X_seq.append(X_num[i:i+seq_len])
+        C_seq.append(cat_idx[i])
+        # predict the action at the next frame after sequence
+        Y_seq.append(y[i+seq_len])
+    return (
+        np.stack(X_seq),
+        np.array(C_seq, dtype=np.int64),
+        np.stack(Y_seq)
+    )
+
+Xn, Xc, y_seq = make_sequences(X_num_all, cat_idx, y_all, SEQ_LEN)
+
+# ───── 4. Train/Val split ─────
 Xn_tr, Xn_val, Xc_tr, Xc_val, y_tr, y_val = train_test_split(
-    X_num, cat_idx, y, test_size=0.2, random_state=42
+    Xn, Xc, y_seq, test_size=0.2, random_state=42
 )
 
 train_ds = TensorDataset(
@@ -71,41 +90,51 @@ val_ds = TensorDataset(
     torch.tensor(Xc_val, dtype=torch.long),
     torch.tensor(y_val,  dtype=torch.float32),
 )
-
 train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True)
 val_dl   = DataLoader(val_ds,   batch_size=BATCH)
 
-# ───── 4. Build model ─────
+# ───── 5. Build model ─────
 emb_sizes = {k: max(m.values()) + 1 for k, m in cat_maps.items()}
-model     = TORCSModel(len(ALL_NUM), emb_sizes, seq_len=1)
+model     = TORCSModel(len(ALL_NUM), emb_sizes, seq_len=SEQ_LEN)
 optimizer = optim.Adam(model.parameters(), lr=LR)
 criterion = nn.MSELoss()
 
-# ───── 5. Training loop ─────
+# ───── 6. Training loop with penalty ─────
 for epoch in range(1, EPOCHS + 1):
-    # train
     model.train()
-    total_train = 0.0
+    train_loss = 0.0
     for xb_num, xb_cat, yb in train_dl:
         pred = model(xb_num, xb_cat)
+        # basic control loss
         loss = criterion(pred, yb)
+        # penalty for off-center track position & angle extremes
+        last = xb_num[:, -1, :]
+        track_pen = torch.mean(torch.abs(last[:, i_track]))
+        angle_pen = torch.mean(torch.abs(last[:, i_angle]))
+        loss = loss + PENALTY * (track_pen + angle_pen)
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total_train += loss.item()
-    avg_train = total_train / len(train_dl)
+        train_loss += loss.item()
+    avg_train = train_loss / len(train_dl)
 
-    # validate
     model.eval()
-    total_val = 0.0
+    val_loss = 0.0
     with torch.no_grad():
         for xb_num, xb_cat, yb in val_dl:
-            total_val += criterion(model(xb_num, xb_cat), yb).item()
-    avg_val = total_val / len(val_dl)
+            pred = model(xb_num, xb_cat)
+            loss_val = criterion(pred, yb)
+            last = xb_num[:, -1, :]
+            track_pen = torch.mean(torch.abs(last[:, i_track]))
+            angle_pen = torch.mean(torch.abs(last[:, i_angle]))
+            loss_val = loss_val + PENALTY * (track_pen + angle_pen)
+            val_loss += loss_val.item()
+    avg_val = val_loss / len(val_dl)
 
     print(f"Epoch {epoch:02}/{EPOCHS} | train_loss {avg_train:.4f} | val_loss {avg_val:.4f}")
 
-# ───── 6. Save artifacts ─────
+# ───── 7. Save artifacts ─────
 torch.save(model.state_dict(), "torcs_model.pt")
 save_preproc(scaler_stats, cat_maps, "preproc.pkl")
-print("✅ Training complete. Model and preproc saved.")
+print("✅ Sequence training complete with penalties. Model and preproc saved.")

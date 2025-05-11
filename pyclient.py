@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 import os
 
 SCR_SERVER_PATH = r"D:\codining\AI\Project\torcs\drivers\scr_server\scr_server.xml"
-NEW_CAR_NAME = "p406"  # Change this to the desired car model
+NEW_CAR_NAME = "p406"  #Change this to the desired car model
 
 def update_car_model():
     try:

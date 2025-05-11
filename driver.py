@@ -268,7 +268,7 @@
 # ---------------------------------------------------------------------
 
 # ───────── configuration ─────────
-USE_ML            = False
+USE_ML            = True
 FOCUS_ACTIVE      = False
 ENABLE_AUTO_RESET = True
 STUCK_SECONDS     = 15.0
@@ -308,7 +308,7 @@ class Driver:
         self.focus_angle   = 0
         self.last_focus_time = 0.0
         self.stuck_timer     = 0.0
-        self.steering_scale  = 0.1
+        self.steering_scale  = 0.5
 
         # static info
         self.track_name, self.car_model = self._get_track_and_car()
