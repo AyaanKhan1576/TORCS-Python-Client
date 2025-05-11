@@ -47,7 +47,7 @@ class Driver:
         self.focus_angle   = 0
         self.last_focus_time = 0.0
         self.stuck_timer   = 0.0
-        self.steering_scale= 0.5
+        self.steering_scale= 0.2
 
         # static info
         self.track_name, self.car_model = self._get_track_and_car()
@@ -131,7 +131,7 @@ class Driver:
         self.prev_gear = new_gear
 
         # 4) steering
-        self.steer = 0.8*self.steer + 0.2*(
+        self.steer = 0.95*self.steer + 0.05*(
             self.steering_scale if left else
             -self.steering_scale if right else 0.0
         )
